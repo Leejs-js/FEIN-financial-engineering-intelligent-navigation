@@ -32,6 +32,8 @@ function hash(text: string) {
 }
 
 const dec = (v: number, digits = 2) => v.toFixed(digits);
+/** 금액은 원 단위 정수로 내려준다 — 소수점 원이 화면에 그대로 찍히지 않게 */
+const won = (v: number) => Math.round(v).toFixed(0);
 const today = () => new Date();
 const isoDate = (d: Date) => d.toISOString().slice(0, 10);
 const nowIso = () => new Date().toISOString();
@@ -125,7 +127,7 @@ interface MockState {
   extraOrders: Array<Record<string, Json>>;
 }
 
-const STATE_KEY = 'fein.mock-api-state.v1';
+const STATE_KEY = 'fein.mock-api-state.v2';
 
 function initialState(): MockState {
   const created = addDays(today(), -182).toISOString();
@@ -142,9 +144,9 @@ function initialState(): MockState {
         id: 'acc-semi-0001',
         account_name: '나의 가상 투자계좌',
         operation_mode: 'SEMI_AUTO',
-        initial_cash: 10_000_000,
-        cash_balance: 412_380,
-        invested_principal: 10_000_000,
+        initial_cash: 20_000_000,
+        cash_balance: 0,
+        invested_principal: 20_000_000,
         status: 'ACTIVE',
         selected_strategy_id: 'low',
         created_at: created,
@@ -154,16 +156,16 @@ function initialState(): MockState {
         id: 'acc-auto-0001',
         account_name: 'AI 자동투자 계좌',
         operation_mode: 'AUTO',
-        initial_cash: 10_000_000,
-        cash_balance: 286_140,
-        invested_principal: 10_000_000,
+        initial_cash: 20_000_000,
+        cash_balance: 0,
+        invested_principal: 20_000_000,
         status: 'ACTIVE',
         selected_strategy_id: 'momentum',
         created_at: created,
         performance: 1.32,
       },
     },
-    carGoal: { car_grade: 'INEX', goal_amount: 30_000_000, updated_at: nowIso() },
+    carGoal: { car_grade: 'INEX', goal_amount: 50_000_000, updated_at: nowIso() },
     decisions: [],
     extraOrders: [],
   };
@@ -210,7 +212,7 @@ function accountResponse(a: MockAccount) {
     account_name: a.account_name,
     operation_mode: a.operation_mode,
     initial_cash: dec(a.initial_cash),
-    cash_balance: dec(a.cash_balance),
+    cash_balance: dec(cashBalance(a)),
     invested_principal: dec(a.invested_principal),
     status: a.status,
     selected_strategy_id: a.selected_strategy_id,
@@ -219,7 +221,7 @@ function accountResponse(a: MockAccount) {
 }
 
 function buildPositions(a: MockAccount) {
-  const investable = a.invested_principal - a.cash_balance;
+  const investable = a.invested_principal * 0.96;
   const totalWeight = STOCKS.reduce((sum, s) => sum + s.weight, 0);
   const rows = STOCKS.map((s) => {
     const rate = s.returnRate * a.performance;
@@ -243,17 +245,23 @@ function buildPositions(a: MockAccount) {
       current_price: dec(s.price),
       previous_close: dec(s.previousClose),
       change_rate: dec(s.changeRate),
-      purchase_amount: dec(purchaseAmount),
-      evaluation_amount: dec(evalAmount),
-      unrealized_profit: dec(unrealized),
+      purchase_amount: won(purchaseAmount),
+      evaluation_amount: won(evalAmount),
+      unrealized_profit: won(unrealized),
       return_rate: dec((unrealized / purchaseAmount) * 100),
       realized_profit: dec(0),
       weight: dec((evalAmount / totalEval) * 100),
-      today_profit: dec(quantity * (s.price - s.previousClose)),
+      today_profit: won(quantity * (s.price - s.previousClose)),
       price_source: 'KIS',
       price_as_of: nowIso(),
     };
   });
+}
+
+/** 매입하고 남은 현금(+실현손익) — 계좌·포트폴리오 응답이 같은 값을 쓰도록 한 곳에서 계산한다 */
+function cashBalance(a: MockAccount) {
+  const purchase = buildPositions(a).reduce((sum, p) => sum + Number(p.purchase_amount), 0);
+  return Math.round(a.invested_principal - purchase + 128_400 * a.performance);
 }
 
 function portfolioResponse(a: MockAccount) {
@@ -263,9 +271,10 @@ function portfolioResponse(a: MockAccount) {
   const totalPurchase = sum('purchase_amount');
   const totalEval = sum('evaluation_amount');
   const unrealized = sum('unrealized_profit');
-  const realized = 128_400 * a.performance;
-  const totalAssets = totalEval + a.cash_balance;
-  const valuationProfit = totalAssets - a.invested_principal + realized;
+  const realized = Math.round(128_400 * a.performance);
+  const cash = cashBalance(a);
+  const totalAssets = totalEval + cash;
+  const valuationProfit = totalAssets - a.invested_principal;
   const contributions = positions
     .map((p) => ({
       stock_code: p.stock_code,
@@ -279,7 +288,7 @@ function portfolioResponse(a: MockAccount) {
     .map((p) => {
       const s = stockByCode(p.stock_code)!;
       const current = Number(p.weight);
-      const diff = s.target - current;
+      const diff = current - s.target; // 백엔드 규약: 현재 - 목표 (양수면 비중 초과 → 매도)
       return { p, s, current, diff };
     })
     .filter(({ diff }) => Math.abs(diff) >= 0.3)
@@ -291,18 +300,18 @@ function portfolioResponse(a: MockAccount) {
       current_weight: dec(current),
       target_weight: dec(s.target),
       weight_diff: dec(diff),
-      action: diff > 0 ? 'BUY' : 'SELL',
+      action: diff > 0 ? 'SELL' : 'BUY',
       recommended_amount: dec(Math.abs((diff / 100) * totalEval), 0),
     }))
     .filter((proposal) => !state.decisions.some((d) => d.proposal_key === proposal.proposal_key));
 
   return {
     account_id: a.id,
-    cash_balance: dec(a.cash_balance),
+    cash_balance: dec(cash),
     total_purchase_amount: dec(totalPurchase),
     total_evaluation_amount: dec(totalEval),
     total_assets: dec(totalAssets),
-    unrealized_profit: dec(unrealized),
+    unrealized_profit: won(unrealized),
     realized_profit: dec(realized),
     return_rate: dec((valuationProfit / a.invested_principal) * 100),
     today_profit: dec(sum('today_profit')),
@@ -440,7 +449,7 @@ function decisionsResponse(a: MockAccount) {
     action,
     current_weight: dec(stock.weight + (action === 'SELL' ? 1.8 : -1.2)),
     target_weight: dec(stock.target),
-    weight_diff: dec(action === 'SELL' ? -1.8 : 1.2),
+    weight_diff: dec(action === 'SELL' ? 1.8 : -1.2),
     recommended_amount: dec(180_000 + i * 42_000, 0),
     decision,
     baseline_snapshot_date: isoDate(addDays(today(), -daysAgo)),
@@ -675,10 +684,15 @@ function backtestResult(body: Record<string, string>) {
   const end = body.endDate;
   const strategyId = body.strategyId;
   const years = Math.max(0.1, (new Date(end).getTime() - new Date(start).getTime()) / (365.25 * 86_400_000));
-  const crash = body.periodId === 'corona-crash' || /2022/.test(body.periodId ?? '');
-  const annual = strategyId === 'momentum' ? 14.1 : 10.2;
-  const final = crash ? (strategyId === 'momentum' ? -12.4 : -6.8) : ((1 + annual / 100) ** years - 1) * 100;
-  const benchFinal = crash ? -24.6 : final * 0.52;
+  // 대표 구간은 실제 KOSPI 흐름에 가깝게 맞춘다 (2020.01~06 소폭 하락 후 회복, 2022년 약 -25%)
+  const momentum = strategyId === 'momentum';
+  const scenarios: Record<string, [number, number]> = {
+    'corona-crash': [momentum ? 1.8 : 4.6, -2.3],
+    'bear-2022': [momentum ? -16.2 : -9.8, -24.9],
+  };
+  const annual = momentum ? 14.1 : 10.2;
+  const fallback = ((1 + annual / 100) ** years - 1) * 100;
+  const [final, benchFinal] = scenarios[body.periodId] ?? (/2022/.test(body.periodId ?? '') ? scenarios['bear-2022'] : [fallback, fallback * 0.52]);
   const points = 60;
   const strat = returnCurve(points, final, hash(strategyId + body.periodId), strategyId === 'momentum' ? 7 : 5);
   const bench = returnCurve(points, benchFinal, hash('kospi' + body.periodId), 6);
@@ -870,10 +884,9 @@ function route(method: string, url: URL, body: Record<string, Json>): Json {
   if (is('POST', /^\/accounts\/[^/]+\/deposits$/)) {
     const a = accountById(seg[1]);
     const amount = Number(body.amount);
-    a.cash_balance += amount;
     a.invested_principal += amount;
     saveState();
-    return { deposit_id: uuid(), account: accountResponse(a), amount: dec(amount), balance_after: dec(a.cash_balance), status: 'COMPLETED' };
+    return { deposit_id: uuid(), account: accountResponse(a), amount: dec(amount), balance_after: dec(cashBalance(a)), status: 'COMPLETED' };
   }
   if (is('GET', /^\/accounts\/[^/]+\/funds$/)) return fundSummary(accountById(seg[1]));
   if (is('POST', /^\/accounts\/[^/]+\/additional-investments$/))
@@ -916,7 +929,7 @@ function route(method: string, url: URL, body: Record<string, Json>): Json {
   if (is('POST', /^\/investment\/onboardings\/[^/]+\/account$/))
     return { account: accountResponse(state.accounts.SEMI_AUTO), created: false, required_deposit_amount: '0', onboarding: onboarding({}, 'READY') };
   if (is('POST', /^\/investment\/onboardings\/[^/]+\/deposit$/))
-    return { deposit_id: uuid(), amount: dec(Number(body.amount)), balance_after: dec(state.accounts.SEMI_AUTO.cash_balance), required_deposit_amount: '0', onboarding: onboarding({}, 'READY') };
+    return { deposit_id: uuid(), amount: dec(Number(body.amount)), balance_after: dec(cashBalance(state.accounts.SEMI_AUTO)), required_deposit_amount: '0', onboarding: onboarding({}, 'READY') };
   if (is('POST', /^\/investment\/onboardings\/[^/]+\/complete$/)) return onboarding({});
 
   // 시세
